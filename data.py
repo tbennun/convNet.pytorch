@@ -8,7 +8,7 @@ from utils.dataset import IndexedFileDataset
 from preprocess import get_transform
 
 
-def get_dataset(name, split='train', transform=None,
+def get_dataset(config, name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path='~/Datasets'):
     train = (split == 'train')
     root = os.path.join(os.path.expanduser(datasets_path), name)
@@ -52,7 +52,8 @@ def get_dataset(name, split='train', transform=None,
         return IndexedFileDataset(root, extract_target_fn=(
             lambda fname: fname.split('/')[0]),
             transform=transform,
-            target_transform=target_transform)
+            target_transform=target_transform,
+            **config)
 
 
 _DATA_ARGS = {'name', 'split', 'transform',
@@ -66,10 +67,11 @@ _OTHER_ARGS = {'distributed'}
 
 
 class DataRegime(object):
-    def __init__(self, regime, defaults={}):
+    def __init__(self, regime, defaults={}, other_config={}):
         self.regime = Regime(regime, defaults)
         self.epoch = 0
         self.steps = None
+        self.config = other_config
         self.get_loader(True)
 
     def get_setting(self):
@@ -92,7 +94,7 @@ class DataRegime(object):
             setting = self.get_setting()
             self._transform = get_transform(**setting['transform'])
             setting['data'].setdefault('transform', self._transform)
-            self._data = get_dataset(**setting['data'])
+            self._data = get_dataset(self.config, **setting['data'])
             if setting['other'].get('distributed', False):
                 setting['loader']['sampler'] = DistributedSampler(self._data)
                 setting['loader']['shuffle'] = None

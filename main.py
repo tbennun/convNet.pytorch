@@ -34,6 +34,8 @@ parser.add_argument('--datasets-dir', metavar='DATASETS_DIR', default='~/Dataset
                     help='datasets dir')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
                     help='dataset name or folder')
+parser.add_argument('--dataset-config', default='',
+                    help='additional training dataset configuration')
 parser.add_argument('--model', '-a', metavar='MODEL', default='alexnet',
                     choices=model_names,
                     help='model architecture: ' +
@@ -156,7 +158,7 @@ def main():
     model_config = {'dataset': args.dataset}
 
     if args.model_config is not '':
-        model_config = dict(model_config, **literal_eval(args.model_config))
+        model_config = dict(model_config, **literal_eval(args.model_config))   
 
     model = model(**model_config)
     logging.info("created model with configuration: %s", model_config)
@@ -216,6 +218,10 @@ def main():
                       distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
                       grad_clip=args.grad_clip, print_freq=args.print_freq, adapt_grad_norm=args.adapt_grad_norm)
 
+    dataset_config = {}
+    if args.dataset_config is not '':
+        dataset_config = dict(dataset_config, **literal_eval(args.dataset_config))   
+
     # Evaluation Data loading code
     args.eval_batch_size = args.eval_batch_size if args.eval_batch_size > 0 else args.batch_size
     val_data = DataRegime(getattr(model, 'data_eval_regime', None),
@@ -228,13 +234,14 @@ def main():
         logging.info(results)
         return
 
+
     # Training Data loading code
     train_data = DataRegime(getattr(model, 'data_regime', None),
                             defaults={'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'train', 'augment': True,
                                       'input_size': args.input_size,  'batch_size': args.batch_size, 'shuffle': True,
                                       'num_workers': args.workers, 'pin_memory': True, 'drop_last': True,
                                       'distributed': args.distributed, 'duplicates': args.duplicates, 'autoaugment': args.duplicates,
-                                      'cutout': {'holes': 1, 'length': 16} if args.cutout else None})
+                                      'cutout': {'holes': 1, 'length': 16} if args.cutout else None}, other_config=dataset_config)
 
     logging.info('optimization regime: %s', optim_regime)
     args.start_epoch = max(args.start_epoch, 0)
