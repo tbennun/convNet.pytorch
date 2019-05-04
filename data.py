@@ -1,4 +1,5 @@
 import os
+import logging
 import torch
 import torchvision.datasets as datasets
 from torch.utils.data.distributed import DistributedSampler
@@ -6,7 +7,8 @@ from torch.utils.data.sampler import RandomSampler
 from utils.regime import Regime
 from utils.dataset import IndexedFileDataset
 from preprocess import get_transform
-
+from threaded_dataloader import ThreadedDataLoader
+from forkonce_dataloader import ForkOnceDataLoader
 
 def get_dataset(config, name, split='train', transform=None,
                 target_transform=None, download=True, datasets_path='~/Datasets'):
@@ -63,7 +65,7 @@ _DATALOADER_ARGS = {'batch_size', 'shuffle', 'sampler', 'batch_sampler',
                     'timeout', 'worker_init_fn'}
 _TRANSFORM_ARGS = {'transform_name', 'input_size', 'scale_size', 'normalize', 'augment',
                    'cutout', 'duplicates', 'num_crops', 'autoaugment'}
-_OTHER_ARGS = {'distributed'}
+_OTHER_ARGS = {'distributed', 'dist_backend', 'rank', 'world_size'}
 
 
 class DataRegime(object):
@@ -96,12 +98,22 @@ class DataRegime(object):
             setting['data'].setdefault('transform', self._transform)
             self._data = get_dataset(self.config, **setting['data'])
             if setting['other'].get('distributed', False):
-                setting['loader']['sampler'] = DistributedSampler(self._data)
+                if setting['other'].get('dist_backend', None) == 'hvd':
+                    setting['loader']['sampler'] = DistributedSampler(
+                        self._data, num_replicas=setting['other'].get('world_size', 1), 
+                        rank=setting['other'].get('rank', 0))
+                else:
+                    setting['loader']['sampler'] = DistributedSampler(self._data)
                 setting['loader']['shuffle'] = None
                 # pin-memory currently broken for distributed
-                setting['loader']['pin_memory'] = False
+                if setting['loader']['num_workers'] != 0:
+                    setting['loader']['pin_memory'] = False
             self._sampler = setting['loader'].get('sampler', None)
-            self._loader = torch.utils.data.DataLoader(
+
+            logging.info('Initializing loader')
+            #self._loader = torch.utils.data.DataLoader( 
+            #self._loader = ThreadedDataLoader(
+            self._loader = ForkOnceDataLoader(
                 self._data, **setting['loader'])
         return self._loader
 

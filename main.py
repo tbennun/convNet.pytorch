@@ -9,6 +9,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import models
+import multiprocessing
 import torch.distributed as dist
 from data import DataRegime
 from utils.log import setup_logging, ResultsLog, save_checkpoint
@@ -20,6 +21,7 @@ from datetime import datetime
 from ast import literal_eval
 from trainer import Trainer
 
+
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
@@ -30,6 +32,8 @@ parser.add_argument('--results-dir', metavar='RESULTS_DIR', default='./results',
                     help='results dir')
 parser.add_argument('--save', metavar='SAVE', default='',
                     help='saved folder')
+parser.add_argument('--save-all', type=bool, default=False,
+                    help='save all checkpoints')
 parser.add_argument('--datasets-dir', metavar='DATASETS_DIR', default='~/Datasets',
                     help='datasets dir')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
@@ -55,7 +59,7 @@ parser.add_argument('--device-ids', default=[0], type=int, nargs='+',
                     help='device ids assignment (e.g 0 1 2 3')
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of distributed processes')
-parser.add_argument('--local_rank', default=-1, type=int,
+parser.add_argument('--local-rank', default=-1, type=int,
                     help='rank of distributed processes')
 parser.add_argument('--dist-init', default='env://', type=str,
                     help='init used to set up distributed training')
@@ -71,6 +75,8 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--eval-batch-size', default=-1, type=int,
                     help='mini-batch size (default: same as training)')
+parser.add_argument('--eval-every', default=1, type=int,
+                    help='evaluate every N epochs (or 0 for none)')
 parser.add_argument('--optimizer', default='SGD', type=str, metavar='OPT',
                     help='optimizer function used')
 parser.add_argument('--label-smoothing', default=0, type=float,
@@ -107,6 +113,8 @@ parser.add_argument('--seed', default=123, type=int,
 
 def main():
     global args, best_prec1, dtype
+    #multiprocessing.set_start_method('spawn')
+    #multiprocessing.set_start_method('forkserver')
     best_prec1 = 0
     args = parser.parse_args()
     dtype = torch_dtypes.get(args.dtype)
@@ -118,21 +126,30 @@ def main():
         args.save = time_stamp
     save_path = os.path.join(args.results_dir, args.save)
 
-    args.distributed = args.local_rank >= 0 or args.world_size > 1
+    args.distributed = args.local_rank >= 0 or args.world_size > 1 or args.dist_backend in ['mpi', 'hvd']
 
     if args.distributed:
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_init,
-                                world_size=args.world_size, rank=args.local_rank)
-        args.local_rank = dist.get_rank()
-        args.world_size = dist.get_world_size()
-        if args.dist_backend == 'mpi':
+        if 'SLURM_NODEID' in os.environ:
+            args.local_rank = int(os.environ['SLURM_NODEID'])
+
+        if args.dist_backend != 'hvd':
+            dist.init_process_group(backend=args.dist_backend, init_method=args.dist_init,
+                                    world_size=args.world_size, rank=args.local_rank)
+            args.local_rank = dist.get_rank()
+            args.world_size = dist.get_world_size()
+            
+        print('rank', args.local_rank, '/', args.world_size)
+        if args.dist_backend in ['mpi', 'hvd']:
             # If using MPI, select all visible devices
             args.device_ids = list(range(torch.cuda.device_count()))
         else:
             args.device_ids = [args.local_rank]
 
     if not os.path.exists(save_path) and not (args.distributed and args.local_rank > 0):
-        os.makedirs(save_path)
+        try:
+            os.makedirs(save_path)
+        except:
+            pass
 
     setup_logging(os.path.join(save_path, 'log.txt'),
                   resume=args.resume is not '',
@@ -213,21 +230,50 @@ def main():
     optimizer = optim_regime if isinstance(optim_regime, OptimRegime) \
         else OptimRegime(model, optim_regime, use_float_copy='half' in args.dtype)
 
-    trainer = Trainer(model, criterion, optimizer,
-                      device_ids=args.device_ids, device=args.device, dtype=dtype,
-                      distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
-                      grad_clip=args.grad_clip, print_freq=args.print_freq, adapt_grad_norm=args.adapt_grad_norm)
+
 
     dataset_config = {}
     if args.dataset_config is not '':
         dataset_config = dict(dataset_config, **literal_eval(args.dataset_config))   
+        # Override rank since it was not defined when batch script was called
+        if 'partition_offset' in dataset_config and 'total_partitions' in dataset_config:
+            dataset_config['partition_offset'] = args.local_rank % dataset_config['total_partitions']
+    print('Dataset config', dataset_config)
 
     # Evaluation Data loading code
     args.eval_batch_size = args.eval_batch_size if args.eval_batch_size > 0 else args.batch_size
     val_data = DataRegime(getattr(model, 'data_eval_regime', None),
                           defaults={'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'val', 'augment': False,
                                     'input_size': args.input_size, 'batch_size': args.eval_batch_size, 'shuffle': False,
-                                    'num_workers': args.workers, 'pin_memory': True, 'drop_last': False})
+                                    'num_workers': args.workers, 'pin_memory': True, 'drop_last': False, 'rank': args.local_rank,
+                                    'world_size': args.world_size})
+
+    if not args.evaluate:
+        # Training Data loading code
+        train_data = DataRegime(getattr(model, 'data_regime', None),
+                                defaults={'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'train', 'augment': True,
+                                          'input_size': args.input_size,  'batch_size': args.batch_size, 'shuffle': True,
+                                          'num_workers': args.workers, 'pin_memory': True, 'drop_last': True,
+                                          'distributed': args.distributed, 'dist_backend': args.dist_backend, 'duplicates': args.duplicates, 
+                                          'autoaugment': args.autoaugment, 'rank': args.local_rank, 'world_size': args.world_size,
+                                          'cutout': {'holes': 1, 'length': 16} if args.cutout else None}, other_config=dataset_config)
+
+    if args.dist_backend == 'hvd':
+        logging.info('Initializing Horovod')
+        import horovod.torch as hvd
+        hvd.init()
+        args.local_rank = hvd.rank()
+        args.world_size = hvd.size()
+        
+        # Horovod: broadcast parameters
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+
+
+    trainer = Trainer(model, criterion, optimizer,
+                      device_ids=args.device_ids, device=args.device, dtype=dtype,
+                      distributed='hvd' if args.dist_backend == 'hvd' else args.distributed, 
+                      local_rank=args.local_rank, mixup=args.mixup,
+                      grad_clip=args.grad_clip, print_freq=args.print_freq, adapt_grad_norm=args.adapt_grad_norm)
 
     if args.evaluate:
         results = trainer.validate(val_data.get_loader())
@@ -235,22 +281,15 @@ def main():
         return
 
 
-    # Training Data loading code
-    train_data = DataRegime(getattr(model, 'data_regime', None),
-                            defaults={'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'train', 'augment': True,
-                                      'input_size': args.input_size,  'batch_size': args.batch_size, 'shuffle': True,
-                                      'num_workers': args.workers, 'pin_memory': True, 'drop_last': True,
-                                      'distributed': args.distributed, 'duplicates': args.duplicates, 'autoaugment': args.duplicates,
-                                      'cutout': {'holes': 1, 'length': 16} if args.cutout else None}, other_config=dataset_config)
-
     logging.info('optimization regime: %s', optim_regime)
     args.start_epoch = max(args.start_epoch, 0)
     trainer.training_steps = args.start_epoch * len(train_data)
-    for epoch in range(args.start_epoch, args.epochs):
+    for i, epoch in enumerate(range(args.start_epoch, args.epochs)):
         trainer.epoch = epoch
         train_data.set_epoch(epoch)
         val_data.set_epoch(epoch)
-        logging.info('\nStarting Epoch: {0}\n'.format(epoch + 1))
+        if not args.distributed or args.local_rank == 0:
+            logging.info('\nStarting Epoch: {0}\n'.format(epoch + 1))
 
         # train for one epoch
         train_results = trainer.train(train_data.get_loader(),
@@ -258,21 +297,24 @@ def main():
                                       chunk_batch=args.chunk_batch)
 
         # evaluate on validation set
-        val_results = trainer.validate(val_data.get_loader())
+        if args.eval_every > 0 and (i % args.eval_every) == 0 and (not args.distributed or args.local_rank == 0):
+            val_results = trainer.validate(val_data.get_loader())
+        else:
+            val_results = {'loss': -1.0, 'error1': -1.0, 'prec1': -1.0, 'error5': -1.0, 'prec5': -1.0}
 
         if args.distributed and args.local_rank > 0:
             continue
 
         # remember best prec@1 and save checkpoint
-        is_best = val_results['prec1'] > best_prec1
-        best_prec1 = max(val_results['prec1'], best_prec1)
+        is_best = train_results['prec1'] > best_prec1
+        best_prec1 = max(train_results['prec1'], best_prec1)
         save_checkpoint({
             'epoch': epoch + 1,
             'model': args.model,
             'config': args.model_config,
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1
-        }, is_best, path=save_path)
+        }, is_best, path=save_path, save_all=args.save_all)
 
         logging.info('\nResults - Epoch: {0}\n'
                      'Training Loss {train[loss]:.4f} \t'
