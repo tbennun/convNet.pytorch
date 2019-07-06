@@ -7,7 +7,7 @@ from torch.utils.data.sampler import RandomSampler
 from utils.regime import Regime
 from utils.dataset import IndexedFileDataset
 from preprocess import get_transform
-from threaded_dataloader import ThreadedDataLoader
+#from threaded_dataloader import ThreadedDataLoader
 from forkonce_dataloader import ForkOnceDataLoader
 
 def get_dataset(config, name, split='train', transform=None,
