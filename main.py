@@ -9,6 +9,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import models
+import multiprocessing
 import torch.distributed as dist
 from os import path, makedirs
 from data import DataRegime, SampledDataRegime
@@ -21,6 +22,7 @@ from datetime import datetime
 from ast import literal_eval
 from trainer import Trainer
 
+
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
@@ -32,10 +34,14 @@ parser.add_argument('--results-dir', metavar='RESULTS_DIR', default='./results',
                     help='results dir')
 parser.add_argument('--save', metavar='SAVE', default='',
                     help='saved folder')
+parser.add_argument('--save-all', type=bool, default=False,
+                    help='save all checkpoints')
 parser.add_argument('--datasets-dir', metavar='DATASETS_DIR', default='~/Datasets',
                     help='datasets dir')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
                     help='dataset name or folder')
+parser.add_argument('--dataset-config', default='',
+                    help='additional training dataset configuration')
 parser.add_argument('--model', '-a', metavar='MODEL', default='alexnet',
                     choices=model_names,
                     help='model architecture: ' +
@@ -55,7 +61,7 @@ parser.add_argument('--device-ids', default=[0], type=int, nargs='+',
                     help='device ids assignment (e.g 0 1 2 3')
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of distributed processes')
-parser.add_argument('--local_rank', default=-1, type=int,
+parser.add_argument('--local-rank', default=-1, type=int,
                     help='rank of distributed processes')
 parser.add_argument('--dist-init', default='env://', type=str,
                     help='init used to set up distributed training')
@@ -71,6 +77,8 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--eval-batch-size', default=-1, type=int,
                     help='mini-batch size (default: same as training)')
+parser.add_argument('--eval-every', default=1, type=int,
+                    help='evaluate every N epochs (or 0 for none)')
 parser.add_argument('--optimizer', default='SGD', type=str, metavar='OPT',
                     help='optimizer function used')
 parser.add_argument('--drop-optim-state', action='store_true', default=False,
@@ -118,6 +126,8 @@ parser.add_argument('--tensorwatch-port', default=0, type=int,
 
 
 def main():
+    global args, best_prec1, dtype
+    best_prec1 = 0
     args = parser.parse_args()
     if args.config_file is not None:
         with open(args.config_file) as f:
@@ -140,14 +150,20 @@ def main_worker(args):
         args.save = time_stamp
     save_path = path.join(args.results_dir, args.save)
 
-    args.distributed = args.local_rank >= 0 or args.world_size > 1
+    args.distributed = args.local_rank >= 0 or args.world_size > 1 or args.dist_backend in ['mpi', 'hvd']
 
     if args.distributed:
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_init,
-                                world_size=args.world_size, rank=args.local_rank)
-        args.local_rank = dist.get_rank()
-        args.world_size = dist.get_world_size()
-        if args.dist_backend == 'mpi':
+        if 'SLURM_NODEID' in os.environ:
+            args.local_rank = int(os.environ['SLURM_NODEID'])
+
+        if args.dist_backend != 'hvd':
+            dist.init_process_group(backend=args.dist_backend, init_method=args.dist_init,
+                                    world_size=args.world_size, rank=args.local_rank)
+            args.local_rank = dist.get_rank()
+            args.world_size = dist.get_world_size()
+            
+        print('rank', args.local_rank, '/', args.world_size)
+        if args.dist_backend in ['mpi', 'hvd']:
             # If using MPI, select all visible devices
             args.device_ids = list(range(torch.cuda.device_count()))
         else:
@@ -155,7 +171,7 @@ def main_worker(args):
 
     if not (args.distributed and args.local_rank > 0):
         if not path.exists(save_path):
-            makedirs(save_path)
+            makedirs(save_path, exist_ok=True)
         export_args_namespace(args, path.join(save_path, 'config.json'))
 
     setup_logging(path.join(save_path, 'log.txt'),
@@ -182,7 +198,7 @@ def main_worker(args):
     model_config = {'dataset': args.dataset}
 
     if args.model_config is not '':
-        model_config = dict(model_config, **literal_eval(args.model_config))
+        model_config = dict(model_config, **literal_eval(args.model_config))   
 
     model = model(**model_config)
     logging.info("created model with configuration: %s", model_config)
@@ -248,25 +264,22 @@ def main_worker(args):
     if optim_state_dict is not None:
         optimizer.load_state_dict(optim_state_dict)
 
-    trainer = Trainer(model, criterion, optimizer,
-                      device_ids=args.device_ids, device=args.device, dtype=dtype, print_freq=args.print_freq,
-                      distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup, cutmix=args.cutmix,
-                      loss_scale=args.loss_scale, grad_clip=args.grad_clip,  adapt_grad_norm=args.adapt_grad_norm)
-    if args.tensorwatch:
-        trainer.set_watcher(filename=path.abspath(path.join(save_path, 'tensorwatch.log')),
-                            port=args.tensorwatch_port)
+    dataset_config = {}
+    if args.dataset_config is not '':
+        dataset_config = dict(dataset_config, **literal_eval(args.dataset_config))   
+        # Override rank since it was not defined when batch script was called
+        if 'partition_offset' in dataset_config and 'total_partitions' in dataset_config:
+            dataset_config['partition_offset'] = args.local_rank % dataset_config['total_partitions']
+    print('Dataset config', dataset_config)
+
 
     # Evaluation Data loading code
     args.eval_batch_size = args.eval_batch_size if args.eval_batch_size > 0 else args.batch_size
     val_data = DataRegime(getattr(model, 'data_eval_regime', None),
                           defaults={'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'val', 'augment': False,
                                     'input_size': args.input_size, 'batch_size': args.eval_batch_size, 'shuffle': False,
-                                    'num_workers': args.workers, 'pin_memory': True, 'drop_last': False})
-
-    if args.evaluate:
-        results = trainer.validate(val_data.get_loader())
-        logging.info(results)
-        return
+                                    'num_workers': args.workers, 'pin_memory': True, 'drop_last': False, 'rank': args.local_rank,
+                                    'world_size': args.world_size})
 
     # Training Data loading code
     train_data_defaults = {'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'train', 'augment': True,
@@ -286,24 +299,53 @@ def main_worker(args):
         train_data = SampledDataRegime(regimes, probs)
     else:
         train_data = DataRegime(
-            getattr(model, 'data_regime', None), defaults=train_data_defaults)
+            getattr(model, 'data_regime', None), defaults=train_data_defaults, other_config=dataset_config)
+
+
+    if args.dist_backend == 'hvd':
+        logging.info('Initializing Horovod')
+        import horovod.torch as hvd
+        hvd.init()
+        args.local_rank = hvd.rank()
+        args.world_size = hvd.size()
+        
+        # Horovod: broadcast parameters
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+
+
+    trainer = Trainer(model, criterion, optimizer,
+                      device_ids=args.device_ids, device=args.device, dtype=dtype, print_freq=args.print_freq,
+                      distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup, cutmix=args.cutmix,
+                      loss_scale=args.loss_scale, grad_clip=args.grad_clip,  adapt_grad_norm=args.adapt_grad_norm)
+    if args.tensorwatch:
+        trainer.set_watcher(filename=path.abspath(path.join(save_path, 'tensorwatch.log')),
+                            port=args.tensorwatch_port)
+
+    if args.evaluate:
+        results = trainer.validate(val_data.get_loader())
+        logging.info(results)
+        return
 
     logging.info('optimization regime: %s', optim_regime)
     logging.info('data regime: %s', train_data)
     args.start_epoch = max(args.start_epoch, 0)
     trainer.training_steps = args.start_epoch * len(train_data)
-    for epoch in range(args.start_epoch, args.epochs):
+    for i, epoch in enumerate(range(args.start_epoch, args.epochs)):
         trainer.epoch = epoch
         train_data.set_epoch(epoch)
         val_data.set_epoch(epoch)
-        logging.info('\nStarting Epoch: {0}\n'.format(epoch + 1))
+        if not args.distributed or args.local_rank == 0:
+            logging.info('\nStarting Epoch: {0}\n'.format(epoch + 1))
 
         # train for one epoch
         train_results = trainer.train(train_data.get_loader(),
                                       chunk_batch=args.chunk_batch)
 
         # evaluate on validation set
-        val_results = trainer.validate(val_data.get_loader())
+        if args.eval_every > 0 and (i % args.eval_every) == 0 and (not args.distributed or args.local_rank == 0):
+            val_results = trainer.validate(val_data.get_loader())
+        else:
+            val_results = {'loss': -1.0, 'error1': -1.0, 'prec1': -1.0, 'error5': -1.0, 'prec5': -1.0}
 
         if args.distributed and args.local_rank > 0:
             continue

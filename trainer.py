@@ -75,8 +75,9 @@ class Trainer(object):
         self.adapt_grad_norm = adapt_grad_norm
         self.watcher = None
         self.streams = {}
+        self.distributed = distributed
 
-        if distributed:
+        if distributed == True:
             self.model = nn.parallel.DistributedDataParallel(model,
                                                              device_ids=device_ids,
                                                              output_device=device_ids[0])
@@ -85,6 +86,15 @@ class Trainer(object):
         else:
             self.model = model
 
+        if distributed == 'hvd':
+            import horovod.torch as hvd
+            logging.info('Initializing Horovod optimizer')
+            self.optimizer.optimizer = hvd.DistributedOptimizer(
+                self.optimizer.optimizer, named_parameters=self.model.named_parameters(),
+                compression=hvd.Compression.none, backward_passes_per_step=1)
+            hvd.broadcast_optimizer_state(self.optimizer.optimizer, root_rank=0)
+
+        
     def _grad_norm(self, inputs_batch, target_batch, chunk_batch=1):
         self.model.zero_grad()
         for inputs, target in zip(inputs_batch.chunk(chunk_batch, dim=0),
@@ -109,7 +119,17 @@ class Trainer(object):
 
         if training:
             self.optimizer.zero_grad()
-            self.optimizer.update(self.epoch, self.training_steps)
+            adjusted = self.optimizer.update(self.epoch, self.training_steps)
+            if adjusted and self.distributed == 'hvd':
+                import horovod.torch as hvd
+                from horovod.torch import _DistributedOptimizer
+                if not hasattr(self.optimizer.optimizer, "_allreduce_delay"): # if not already a DistributedOptimizer
+                    logging.info('Resetting optimizer')
+                    self.optimizer.optimizer = hvd.DistributedOptimizer(
+                        self.optimizer.optimizer, named_parameters=self.model.named_parameters(),
+                        compression=hvd.Compression.none, backward_passes_per_step=1)
+                    hvd.broadcast_optimizer_state(self.optimizer.optimizer, root_rank=0)
+                
 
         for i, (inputs, target) in enumerate(zip(inputs_batch.chunk(chunk_batch, dim=0),
                                                  target_batch.chunk(chunk_batch, dim=0))):
@@ -232,7 +252,7 @@ class Trainer(object):
             meters['step'].update(time.time() - end)
             end = time.time()
 
-            if i % self.print_freq == 0 or i == len(data_loader) - 1:
+            if self.local_rank <= 0 and (i % self.print_freq == 0 or i == len(data_loader) - 1):
                 report = str('{phase} - Epoch: [{0}][{1}/{2}]\t'
                              'Time {meters[step].val:.3f} ({meters[step].avg:.3f})\t'
                              'Data {meters[data].val:.3f} ({meters[data].avg:.3f})\t'
