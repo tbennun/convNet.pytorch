@@ -1,6 +1,7 @@
 import argparse
 import time
 import logging
+import os
 import json
 import torch
 import torch.nn as nn
@@ -34,8 +35,6 @@ parser.add_argument('--results-dir', metavar='RESULTS_DIR', default='./results',
                     help='results dir')
 parser.add_argument('--save', metavar='SAVE', default='',
                     help='saved folder')
-parser.add_argument('--save-all', type=bool, default=False,
-                    help='save all checkpoints')
 parser.add_argument('--datasets-dir', metavar='DATASETS_DIR', default='~/Datasets',
                     help='datasets dir')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
@@ -285,7 +284,9 @@ def main_worker(args):
     train_data_defaults = {'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'train', 'augment': True,
                            'input_size': args.input_size,  'batch_size': args.batch_size, 'shuffle': True,
                            'num_workers': args.workers, 'pin_memory': True, 'drop_last': True,
-                           'distributed': args.distributed, 'duplicates': args.duplicates, 'autoaugment': args.autoaugment,
+                           'distributed': args.distributed, 'dist_backend': args.dist_backend, 
+                           'duplicates': args.duplicates, 'autoaugment': args.autoaugment,
+                           'rank': args.local_rank, 'world_size': args.world_size,
                            'cutout': {'holes': 1, 'length': 16} if args.cutout else None}
 
     if hasattr(model, 'sampled_data_regime'):
@@ -315,7 +316,8 @@ def main_worker(args):
 
     trainer = Trainer(model, criterion, optimizer,
                       device_ids=args.device_ids, device=args.device, dtype=dtype, print_freq=args.print_freq,
-                      distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup, cutmix=args.cutmix,
+                      distributed='hvd' if args.dist_backend == 'hvd' else args.distributed, 
+                      local_rank=args.local_rank, mixup=args.mixup, cutmix=args.cutmix,
                       loss_scale=args.loss_scale, grad_clip=args.grad_clip,  adapt_grad_norm=args.adapt_grad_norm)
     if args.tensorwatch:
         trainer.set_watcher(filename=path.abspath(path.join(save_path, 'tensorwatch.log')),

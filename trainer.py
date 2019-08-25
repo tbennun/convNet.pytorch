@@ -1,5 +1,6 @@
 import time
 import logging
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -267,6 +268,7 @@ class Trainer(object):
                     report += 'Grad {meters[grad].val:.3f} ({meters[grad].avg:.3f})'\
                         .format(meters=meters)
                 logging.info(report)
+                sys.stdout.flush()
                 self.observe(trainer=self,
                              model=self._model,
                              optimizer=self.optimizer,
